@@ -278,8 +278,8 @@ for K in TRY_K_LIST:
     plt.title(f"Top-30 Feature Saliency ρ (FSHMM, K={K})")
     plt.axvline(0.5, linestyle="--")
     plt.tight_layout()
-    plt.savefig(f"{OUT_DIR}/saliency_top30_K{K}.png", dpi=200)   # <—— 保存
-    plt.show()                                                   # <—— 展示
+    plt.savefig(f"{OUT_DIR}/saliency_top30_K{K}.png", dpi=200)   
+    plt.show()                                                 
 
     # ---- Regime PATH (discrete states 1..K) ----
     states = fshmm.predict(X)   # (T,)
@@ -289,8 +289,8 @@ for K in TRY_K_LIST:
     plt.xlabel("Date"); plt.ylabel("Regime")
     plt.title(f"FSHMM Regime Path (K={K})")
     plt.tight_layout()
-    plt.savefig(f"{OUT_DIR}/regime_path_fshmm_K{K}.png", dpi=200)  # <—— 保存
-    plt.show()                                                     # <—— 展示
+    plt.savefig(f"{OUT_DIR}/regime_path_fshmm_K{K}.png", dpi=200) 
+    plt.show()                                                    
 
     # ---- Optional: Full-cov HMM on FS features, PATH only ----
     if TRY_REFIT_FULL_HMM:
@@ -307,5 +307,5 @@ for K in TRY_K_LIST:
             plt.xlabel("Date"); plt.ylabel("Regime")
             plt.title(f"Full-cov HMM Regime Path (K={K})")
             plt.tight_layout()
-            plt.savefig(f"{OUT_DIR}/regime_path_fullhmm_K{K}.png", dpi=200)  # <—— 保存
-            plt.show()                                                       # <—— 展示
+            plt.savefig(f"{OUT_DIR}/regime_path_fullhmm_K{K}.png", dpi=200)  
+            plt.show()                                                      
