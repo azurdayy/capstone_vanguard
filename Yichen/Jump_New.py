@@ -181,87 +181,112 @@ class RegularizedJumpModel(JumpModel):
             K: int,
             gamma: float,
             penalty: PenaltyType,
+            jitter: bool = True,
         ) -> pd.DataFrame:
             """
-            Proximal update of mu under fixed assignments s, following Proposition B.3.
-            Steps:
-            1) compute unregularized centers mu_star (cluster means)
-            2) apply penalty-specific proximal/shrinkage to obtain mu
-            """
-            if len(s) != len(data):
-                raise ValueError(f"len(s)={len(s)} must equal len(data)={len(data)}")
-            if not np.issubdtype(np.asarray(s).dtype, np.integer):
-                raise TypeError("s must be integer labels (1..K)")
+            Update cluster centers (mu) under fixed assignments `s` using
+            the Regularized Jump Model formulas (Proposition B.3, Eq. B.1a–B.1d).
 
-            # ---------- (1) unregularized cluster centers mu_star ----------
+            Parameters
+            ----------
+            s : np.ndarray
+                Cluster assignments of length T (values in 1..K).
+            data : pd.DataFrame
+                Observations Y of shape (T, p).
+            feature_names : list[str]
+                Column names of features.
+            K : int
+                Number of clusters/states.
+            gamma : float
+                Regularization strength (T * gamma appears in the formula).
+            penalty : PenaltyType
+                One of L0, LASSO, RIDGE, GROUP_LASSO.
+            jitter : bool, default True
+                If True, add a small random jitter to empty clusters to prevent “dead clusters”.
+
+            Returns
+            -------
+            mu_df : pd.DataFrame
+                Updated cluster centers, shape (K, p), rows 1..K.
+            """
+
+            # ---------- Validate ----------
+            if len(s) != len(data):
+                raise ValueError("Length of state sequence must match number of samples.")
+            if not np.issubdtype(np.asarray(s).dtype, np.integer):
+                raise TypeError("Cluster assignments s must be integers (1..K).")
+
             s = np.asarray(s, dtype=int)
             state = pd.Series(s, index=data.index, name="state")
-            mu_star = data.groupby(state).mean(numeric_only=True)
-            mu_star = mu_star.reindex(range(1, K + 1))           # ensure rows 1..K
-            mu_star = mu_star.reindex(columns=feature_names)     # keep column order
 
-            # cluster sizes |C_k|
+            # ---------- Step 1: Compute unregularized cluster means mu_star ----------
+            mu_star = data.groupby(state).mean(numeric_only=True)
+            mu_star = mu_star.reindex(range(1, K + 1)).fillna(0.0)
+            mu_star = mu_star.reindex(columns=feature_names).fillna(0.0)
+
+            # Cluster sizes |C_k|
             counts = state.value_counts().reindex(range(1, K + 1)).fillna(0).astype(int)
-            counts_arr = counts.to_numpy(dtype=float)            # shape (K,)
+            counts_arr = counts.to_numpy(dtype=float)
             Tn = float(len(data))
 
-            # start from mu_star array
-            mu_out = mu_star.to_numpy(copy=True)                 # (K, p)
+            mu_star_arr = mu_star.to_numpy(copy=True)
+            mu_out = mu_star_arr.copy()
             Y = data.to_numpy()
-            K_, p = mu_out.shape
-            assert K_ == K
+            s_idx = s - 1  # zero-based cluster indices
 
+            # ---------- Step 2: Apply penalty-specific proximal updates ----------
             if penalty == PenaltyType.LASSO:
-                # Element-wise soft-threshold: max(0, 1 - T*gamma / (2|C_k||mu*_{k,j}|)) * mu*_{k,j}
+                # Elementwise soft thresholding (Eq. B.1b)
                 abs_mu = np.abs(mu_out)
                 denom = 2.0 * counts_arr[:, None] * abs_mu
                 scale = np.ones_like(mu_out)
                 mask = denom > 0
-                scale[mask] = np.maximum(0.0, 1.0 - (Tn * float(gamma)) / denom[mask])
+                scale[mask] = np.maximum(0.0, 1.0 - (Tn * gamma) / denom[mask])
                 mu_out = scale * mu_out
 
             elif penalty == PenaltyType.RIDGE:
-                # Row-wise shrink: factor_k = 1 / (1 + T*gamma / |C_k|)
+                # Row-wise shrinkage (Eq. B.1c)
                 with np.errstate(divide='ignore', invalid='ignore'):
-                    factors = 1.0 / (1.0 + (Tn * float(gamma)) / counts_arr)
-                    factors[~np.isfinite(factors)] = 0.0  # handle |C_k|=0 -> factor 0
+                    factors = 1.0 / (1.0 + (Tn * gamma) / counts_arr)
+                    factors[~np.isfinite(factors)] = 0.0  # handle |C_k|=0
                 mu_out = (factors[:, None]) * mu_out
 
             elif penalty == PenaltyType.GROUP_LASSO:
-                # Column-wise group shrink by ||mu*_{.,j}||
+                # Column-wise group shrinkage (Eq. B.1d)
                 col_norm = np.linalg.norm(mu_out, axis=0)  # (p,)
-                for j in range(p):
+                for j in range(len(feature_names)):
                     nj = col_norm[j]
                     if nj == 0.0:
                         mu_out[:, j] = 0.0
                         continue
                     denom = 2.0 * counts_arr * nj
-                    factors = 1.0 / (1.0 + (Tn * float(gamma)) / denom)
+                    factors = 1.0 / (1.0 + (Tn * gamma) / denom)
                     factors[~np.isfinite(factors)] = 0.0
                     mu_out[:, j] = factors * mu_out[:, j]
 
             elif penalty == PenaltyType.L0:
-                # Hard column selection:
-                # keep mu*_{.,j} iff ||Y_.j||^2 > ||Y_.j - M mu*_.j||^2 + T*gamma, else zero the column
-                mu_star_arr = mu_star.to_numpy()
-                s_idx = s - 1  # 0..K-1
-                for j in range(p):
+                # Hard column selection (Eq. B.1a)
+                for j in range(len(feature_names)):
                     yj = Y[:, j]
-                    yhat_j = mu_star_arr[s_idx, j]  # predicted by current assignments and mu*
+                    yhat_j = mu_star_arr[s_idx, j]
                     lhs = np.sum(yj * yj)
-                    rhs = np.sum((yj - yhat_j) ** 2) + Tn * float(gamma)
+                    rhs = np.sum((yj - yhat_j) ** 2) + Tn * gamma
                     if lhs <= rhs:
-                        mu_out[:, j] = 0.0  # zero entire column
+                        mu_out[:, j] = 0.0
 
             else:
-                # no shrink (fallback)
-                pass
+                raise ValueError(f"Unsupported penalty type: {penalty}")
 
-            # back to DataFrame
+            # ---------- Step 3: Optional jitter for empty clusters ----------
+            if jitter:
+                empty_mask = counts_arr == 0
+                if empty_mask.any():
+                    noise = np.random.normal(scale=1e-3, size=mu_out.shape)
+                    mu_out[empty_mask, :] += noise[empty_mask, :]
+
+            # ---------- Step 4: Return as DataFrame ----------
             mu_df = pd.DataFrame(mu_out, index=mu_star.index, columns=mu_star.columns)
-            print(mu_df)
             return mu_df
-
 
         def _update_s(
             mu: pd.DataFrame | np.ndarray,
@@ -296,7 +321,6 @@ class RegularizedJumpModel(JumpModel):
             for t in range(1, T):
                 costs = V[t, :] + lam * (np.arange(K) != s_idx[t - 1])
                 s_idx[t] = int(np.argmin(costs))
-            print(s_idx)
             return s_idx + 1  # labels 1..K
 
         # ---------- main loop ----------
