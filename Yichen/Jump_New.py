@@ -397,6 +397,59 @@ class RegularizedJumpModel(JumpModel):
             "score": best_score,
             "feature_importance": importance_by_feature,
         }
+    
+    def predict(self, oos_data: pd.DataFrame):
+        """
+        Assign regimes to out-of-sample (OOS) data using calibrated parameters, considering the jump penalty (lmbd),
+        and update object parameters.
+
+        Parameters
+        ----------
+        oos_data : pd.DataFrame
+            Out-of-sample data with the same features as the in-sample data.
+        """
+        if self.mu is None or self.lmbd is None:
+            raise RuntimeError("Model must be calibrated on IS data before predicting OOS data.")
+        if not isinstance(oos_data, pd.DataFrame):
+            raise TypeError("OOS data must be a pandas DataFrame.")
+        if not all(col in oos_data.columns for col in self.feature_names):
+            raise ValueError("OOS data must contain the same features as the IS data.")
+
+        # Normalize OOS data using the same normalization method as IS data
+        oos_data = oos_data[self.feature_names].copy()  # Ensure column order matches
+        self.data = normalized(oos_data)  # Update the object's data attribute
+
+        # Assign regimes based on the closest cluster center, considering jump penalty
+        Y = self.data.to_numpy()
+        mu = self.mu.to_numpy()
+        T, K = Y.shape[0], mu.shape[0]
+
+        # Dynamic programming to minimize cost with jump penalty
+        cost = np.full((T, K), np.inf)  # Cost matrix
+        backtrack = np.zeros((T, K), dtype=int)  # Backtrack matrix
+
+        # Initialize the first time step
+        for k in range(K):
+            cost[0, k] = np.sum((Y[0] - mu[k]) ** 2)
+
+        # Fill the cost matrix
+        for t in range(1, T):
+            for k in range(K):
+                for j in range(K):
+                    jump_cost = self.lmbd if j != k else 0
+                    total_cost = cost[t - 1, j] + np.sum((Y[t] - mu[k]) ** 2) + jump_cost
+                    if total_cost < cost[t, k]:
+                        cost[t, k] = total_cost
+                        backtrack[t, k] = j
+
+        # Backtrack to find the optimal state sequence
+        self.s = np.zeros(T, dtype=int)
+        self.s[-1] = np.argmin(cost[-1]) + 1  # Regimes are 1-indexed
+        for t in range(T - 2, -1, -1):
+            self.s[t] = backtrack[t + 1, self.s[t + 1] - 1] + 1
+
+        # Update regime series
+        self.regime_series = pd.Series(self.s, index=self.data.index, name="regime")
 
     def visualize(
         self,
@@ -1266,4 +1319,3 @@ def plot_frobenius_drift(
     ax.legend()
     fig.tight_layout()
     return fig, ax
-
