@@ -156,7 +156,7 @@ class RegularizedJumpModel(JumpModel):
         reg = self.compute_penalty(mu_df)
 
         # Total score
-        return float(recon + lmbd * jumps + gamma * reg)
+        return float(recon + lmbd * jumps + gamma * reg), float(recon + lmbd * jumps)
 
     def calibrate(self, max_iter: int = 10) -> Dict[int, Dict[str, object]]:
         """
@@ -356,7 +356,7 @@ class RegularizedJumpModel(JumpModel):
                 s = _update_s(mu=mu_df, data=data, lam=lam)
                 i += 1
 
-            score = self._compute_model_score(mu_df, s)
+            score, raw_score = self._compute_model_score(mu_df, s)
 
             results_per_init[percent] = {
                 "mu": mu_df,
@@ -365,6 +365,7 @@ class RegularizedJumpModel(JumpModel):
                 "state_sequence": s,
                 "iterations": i,
                 "score": score,
+                "raw_score": raw_score
             }
 
             # track the best (min score); tie-breaker: smaller percent
@@ -374,6 +375,7 @@ class RegularizedJumpModel(JumpModel):
                 best_mu_df = mu_df
                 best_s = s.copy()
                 best_iter = i
+                best_raw_score = raw_score
 
         # --- set model state to the best run ---
         assert best_mu_df is not None and best_s is not None and best_pct is not None
@@ -397,6 +399,7 @@ class RegularizedJumpModel(JumpModel):
             "state_sequence": best_s,
             "iterations": best_iter,
             "score": best_score,
+            "raw_score": best_raw_score,
             "feature_importance": importance_by_feature,
         }
 
@@ -1229,3 +1232,86 @@ def plot_frobenius_drift(
     fig.tight_layout()
     return fig, ax
 
+def sweep_k_and_plot_scores(
+    data: pd.DataFrame,
+    lmbd: float,
+    gamma: float,
+    penalty: Union[str, "PenaltyType"] = "lasso",
+    k_values: Tuple[int, ...] = (2, 3, 4, 5, 6),
+    max_iter: int = 10,
+    random_state: int = 42,
+    show: bool = True,
+) -> pd.Series:
+    """
+    Run RegularizedJumpModel calibration for multiple K values and plot the total score curve.
+
+    Parameters
+    ----------
+    data : pd.DataFrame
+        Input feature matrix of shape (T, p). Must be numeric and NaN-free.
+    lmbd : float
+        Lambda (λ): jump penalty weight.
+    gamma : float
+        Gamma (γ): regularization penalty weight.
+    penalty : str | PenaltyType, default "lasso"
+        One of {"l0", "lasso", "ridge", "group_lasso"} or PenaltyType enum.
+    k_values : tuple[int, ...], default (2,3,4,5,6)
+        The list of number-of-states to evaluate.
+    max_iter : int, default 10
+        Max alternating updates in `calibrate()`.
+    random_state : int, default 42
+        Random seed passed to `initialize()`.
+    show : bool, default True
+        If True, display the matplotlib chart.
+
+    Returns
+    -------
+    pd.Series
+        Index = K, values = calibration total scores (lower is better).
+    """
+    scores: Dict[int, float] = {}
+    errors: Dict[int, str] = {}
+
+    for k in k_values:
+        try:
+            # Build and run the model for this K
+            model = RegularizedJumpModel(k=k, lmbd=lmbd, gamma=gamma, penalty=penalty)
+            model.input_data(data)
+            model.initialize(random_state=random_state)
+            result = model.calibrate(max_iter=max_iter)
+            score_k = float(result["raw_score"])
+            scores[k] = score_k
+            # Optional: print per-K summary
+            print(f"[K={k}] score={score_k:.4f}, iters={result['iterations']}, best%={result['best_percentage']}")
+        except Exception as e:
+            # Keep going even if one K fails
+            errors[k] = repr(e)
+            print(f"[K={k}] ERROR: {e!r}")
+
+    # Convert to a series sorted by K
+    if len(scores) == 0:
+        raise RuntimeError(
+            "All calibrations failed. "
+            + ("First error: " + next(iter(errors.values())) if errors else "")
+        )
+
+    score_series = pd.Series(scores).sort_index()
+
+    # Plot line chart K vs score
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(score_series.index.values, score_series.values, marker="o")
+    ax.set_xlabel("Number of states K")
+    ax.set_ylabel("Total score (lower is better)")
+    ax.set_title("RegularizedJumpModel: Score vs K")
+    ax.grid(True)
+    plt.tight_layout()
+    if show:
+        plt.show()
+
+    # If some K failed, print a concise note so you can inspect
+    if errors:
+        print("\nSome K values failed during calibration:")
+        for k, msg in errors.items():
+            print(f"  - K={k}: {msg}")
+
+    return score_series
