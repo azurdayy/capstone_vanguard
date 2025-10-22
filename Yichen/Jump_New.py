@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from enum import Enum
 from typing import Tuple, Dict, List, Optional, Union, Any
+from math import sqrt
 
 from pathlib import Path
 import pandas as pd
@@ -11,6 +12,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 import optuna
 from collections import OrderedDict
+from scipy.stats import f as f_dist
 
 PROJECT_DIR = Path(__file__).resolve()
 sys.path.insert(0, str(PROJECT_DIR))
@@ -397,59 +399,6 @@ class RegularizedJumpModel(JumpModel):
             "score": best_score,
             "feature_importance": importance_by_feature,
         }
-    
-    def predict(self, oos_data: pd.DataFrame):
-        """
-        Assign regimes to out-of-sample (OOS) data using calibrated parameters, considering the jump penalty (lmbd),
-        and update object parameters.
-
-        Parameters
-        ----------
-        oos_data : pd.DataFrame
-            Out-of-sample data with the same features as the in-sample data.
-        """
-        if self.mu is None or self.lmbd is None:
-            raise RuntimeError("Model must be calibrated on IS data before predicting OOS data.")
-        if not isinstance(oos_data, pd.DataFrame):
-            raise TypeError("OOS data must be a pandas DataFrame.")
-        if not all(col in oos_data.columns for col in self.feature_names):
-            raise ValueError("OOS data must contain the same features as the IS data.")
-
-        # Normalize OOS data using the same normalization method as IS data
-        oos_data = oos_data[self.feature_names].copy()  # Ensure column order matches
-        self.data = normalized(oos_data)  # Update the object's data attribute
-
-        # Assign regimes based on the closest cluster center, considering jump penalty
-        Y = self.data.to_numpy()
-        mu = self.mu.to_numpy()
-        T, K = Y.shape[0], mu.shape[0]
-
-        # Dynamic programming to minimize cost with jump penalty
-        cost = np.full((T, K), np.inf)  # Cost matrix
-        backtrack = np.zeros((T, K), dtype=int)  # Backtrack matrix
-
-        # Initialize the first time step
-        for k in range(K):
-            cost[0, k] = np.sum((Y[0] - mu[k]) ** 2)
-
-        # Fill the cost matrix
-        for t in range(1, T):
-            for k in range(K):
-                for j in range(K):
-                    jump_cost = self.lmbd if j != k else 0
-                    total_cost = cost[t - 1, j] + np.sum((Y[t] - mu[k]) ** 2) + jump_cost
-                    if total_cost < cost[t, k]:
-                        cost[t, k] = total_cost
-                        backtrack[t, k] = j
-
-        # Backtrack to find the optimal state sequence
-        self.s = np.zeros(T, dtype=int)
-        self.s[-1] = np.argmin(cost[-1]) + 1  # Regimes are 1-indexed
-        for t in range(T - 2, -1, -1):
-            self.s[t] = backtrack[t + 1, self.s[t + 1] - 1] + 1
-
-        # Update regime series
-        self.regime_series = pd.Series(self.s, index=self.data.index, name="regime")
 
     def visualize(
         self,
@@ -732,49 +681,49 @@ class RegularizedJumpModel(JumpModel):
             "study": study,
         }
 
-    def summarize_by_regime_from_daily_returns(
+    def summarize_regime_table_minimal(
         self,
-        daily_returns: Union[pd.Series, pd.DataFrame, Dict[str, Union[pd.Series, pd.DataFrame]]],
-        pct_view: bool = False,
+        monthly_returns: Union[pd.Series, pd.DataFrame, Dict[str, Union[pd.Series, pd.DataFrame]]],
         default_asset_name: str = "asset",
+        mean_digits: int = 3,
+        std_digits: int = 3,
+        p_digits: int = 4,
         *,
-        do_anova: bool = True,
-        do_kruskal: bool = True,
-        do_pairwise: bool = False,          # set True to run pairwise tests (if scipy available)
-    ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, pd.DataFrame]]:
+        match_nearest: bool = True,
+        match_tolerance: str = "45D",   # max tolerance for nearest-month match (e.g., "31D", "45D")
+        vol_annualize: bool = True,     # if True, volatility = std * sqrt(12); otherwise use monthly std
+        vol_label: str = "ann vol",     # text label shown inside cell, e.g., "ann vol" or "monthly vol"
+    ) -> pd.DataFrame:
         """
-        Summarize per-regime stats for one or many assets, and run statistical tests
-        to check whether returns differ across regimes.
+        Build a summary table of monthly returns by regime.
 
-        Returns
-        -------
-        summary_all : DataFrame
-            Numeric table, MultiIndex (asset, regime).
-        summary_all_pct : DataFrame
-            Percentage string view.
-        tests : dict[str, DataFrame]
-            {
-              'anova':    DataFrame by asset (F, pvalue, df_between, df_within, n_groups, n_total),
-              'kruskal':  DataFrame by asset (H, pvalue, k),
-              'pairwise': DataFrame by (asset, reg_i, reg_j) with Welch t-tests + Holm-adjusted p
-            }
+        - Rows: each regime label + final row 'ANOVA p-value'
+        - Cols: asset names
+        - Cells: 'mean ± std (ann vol X.XXX)' per regime-asset cell
+            * std is the dispersion of monthly returns within that regime.
+            * volatility shown is either monthly std or annualized (std * sqrt(12)), controlled by 'vol_annualize'.
+        - Last row: one-way ANOVA p-values comparing means across regimes (per asset)
+
+        Assumptions:
+        - monthly_returns are already MONTHLY data (DatetimeIndex or PeriodIndex)
+        - regime_series is indexed by the FIRST day of month but represents the PREVIOUS month's regime → we shift -1 month.
         """
-        # ---------- Validate model state ----------
+
+        # --------- Fetch regime (monthly) ----------
         if self.data is None:
             raise RuntimeError("Model has no data. Call input_data() first.")
 
-        # Prefer calibrated regime_series; otherwise fall back to self.s
         if getattr(self, "regime_series", None) is not None:
             regime = self.regime_series.copy()
         else:
-            if self.s is None:
+            if getattr(self, "s", None) is None:
                 raise RuntimeError("No regime sequence. Run calibrate() first.")
             regime = pd.Series(self.s, index=self.data.index, name="regime")
 
         if not isinstance(regime.index, (pd.DatetimeIndex, pd.PeriodIndex)):
             raise TypeError("Regime index must be datetime-like.")
 
-        # ---------- Utilities ----------
+        # Normalize a 1-col DataFrame to a Series
         def _ensure_series(x: Union[pd.Series, pd.DataFrame]) -> pd.Series:
             if isinstance(x, pd.DataFrame):
                 if x.shape[1] != 1:
@@ -782,230 +731,190 @@ class RegularizedJumpModel(JumpModel):
                 x = x.squeeze("columns")
             return x
 
-        def _to_month_period_index(s: pd.Series) -> pd.Series:
+        # Convert to monthly PeriodIndex; if shift_prev=True, subtract 1 month (month-start regime → previous month)
+        def _to_month_period_index(s: pd.Series, shift_prev: bool = False) -> pd.Series:
             if isinstance(s.index, pd.PeriodIndex):
-                return s.set_axis(s.index.asfreq("M"))
-            if not isinstance(s.index, pd.DatetimeIndex):
+                pidx = s.index.asfreq("M")
+            elif isinstance(s.index, pd.DatetimeIndex):
+                pidx = s.index.to_period("M")
+            else:
                 raise TypeError("Series must have DatetimeIndex or PeriodIndex.")
-            return s.set_axis(s.index.to_period("M"))
+            if shift_prev:
+                pidx = pidx - 1
+            return s.set_axis(pidx)
 
-        # Prepare monthly regime series
-        regime_series = _ensure_series(regime).rename("regime")
-        regime_series = _to_month_period_index(regime_series)
+        # Regime periods are shifted back by one month
+        regime_m = _to_month_period_index(_ensure_series(regime), shift_prev=True).rename("regime")
         try:
-            regime_series = regime_series.astype("Int64")
+            regime_m = regime_m.astype("Int64")
         except Exception:
             pass
 
-        # Single asset -> convert to dict for unified processing
-        if not isinstance(daily_returns, dict):
-            daily_returns = {default_asset_name: daily_returns}
+        # --------- Normalize assets ----------
+        if not isinstance(monthly_returns, dict):
+            monthly_returns = {default_asset_name: monthly_returns}
 
-        summary_frames: Dict[str, pd.DataFrame] = {}
-        summary_pct_frames: Dict[str, pd.DataFrame] = {}
-
-        # For tests we need to keep per-asset per-regime monthly returns vectors
-        per_asset_groups: Dict[str, Dict[int, np.ndarray]] = {}
-
-        for asset_name, dr in daily_returns.items():
-            r = _ensure_series(dr).dropna().copy()
-            if not isinstance(r.index, pd.DatetimeIndex):
-                raise TypeError(f"daily_returns for '{asset_name}' must have a DatetimeIndex.")
-            r.name = r.name or f"{asset_name}_daily_return"
-
-            # Monthly aggregation
-            m_ret = (1.0 + r).resample("M").apply(np.prod) - 1.0
-            m_ret.name = "monthly_return"
-            intra_month_vol = r.resample("M").std()
-            intra_month_vol.name = "intra_month_vol"
-
-            monthly_df = pd.concat([m_ret, intra_month_vol], axis=1).dropna()
-            monthly_df.index = monthly_df.index.to_period("M")
-
-            # Align with regimes
-            aligned = monthly_df.join(regime_series, how="inner")
-            if aligned.empty:
-                raise ValueError(
-                    f"No overlapping months between '{asset_name}' returns and model regime."
-                )
-            if aligned["regime"].isna().any():
-                aligned = aligned.dropna(subset=["regime"])
-            aligned["regime"] = aligned["regime"].astype(int)
-
-            # Summary table
-            summary = (
-                aligned.groupby("regime")
-                       .agg(mean_monthly_return=("monthly_return", "mean"),
-                            mean_intra_month_vol=("intra_month_vol", "mean"),
-                            count_months=("monthly_return", "size"))
-                       .sort_index()
-            )
-
-            # Percentage view
-            summary_pct = summary.copy()
-            summary_pct["mean_monthly_return"] = (summary_pct["mean_monthly_return"] * 100).map("{:.2f}%".format)
-            summary_pct["mean_intra_month_vol"] = (summary_pct["mean_intra_month_vol"] * 100).map("{:.2f}%".format)
-
-            summary_frames[asset_name] = summary
-            summary_pct_frames[asset_name] = summary_pct
-
-            # Collect vectors by regime for tests
-            groups = {
-                reg: grp["monthly_return"].to_numpy(copy=True)
-                for reg, grp in aligned.groupby("regime")
-            }
-            per_asset_groups[asset_name] = groups
-
-        # Stack summaries
-        summary_all = pd.concat(summary_frames, names=["asset", "regime"]).sort_index()
-        summary_all_pct = pd.concat(summary_pct_frames, names=["asset", "regime"]).sort_index()
-
-        # ---------- Statistical tests ----------
-        tests: Dict[str, pd.DataFrame] = {}
-
-        # Helpers for tests (scipy optional)
-        try:
-            from scipy.stats import f as f_dist
-            from scipy.stats import kruskal as kruskal_test
-            from scipy.stats import ttest_ind
-            SCIPY_OK = True
-        except Exception:
-            SCIPY_OK = False
-
-        def _anova_numpy(groups_dict: Dict[int, np.ndarray]):
-            """Return F, pvalue (if scipy available), df_between, df_within, n_groups, n_total."""
-            # Drop empty groups
+        # --------- One-way ANOVA (numerical implementation) ----------
+        def _anova_numpy(groups_dict: Dict[int, np.ndarray]) -> float:
+            """Compute one-way ANOVA p-value across regimes."""
             vals = [g[~np.isnan(g)] for g in groups_dict.values() if g is not None and g.size > 0]
             ns = [len(v) for v in vals]
             k = len(vals)
             n_total = sum(ns)
             if k < 2 or n_total <= k:
-                return np.nan, np.nan, 0, 0, k, n_total
-
+                return np.nan
             all_concat = np.concatenate(vals)
-            grand_mean = all_concat.mean()
+            grand = all_concat.mean()
+            ss_between = sum(n * (v.mean() - grand) ** 2 for v, n in zip(vals, ns))
+            ss_within  = sum(((v - v.mean()) ** 2).sum() for v in vals)
+            dfb, dfw = k - 1, n_total - k
+            if dfw <= 0:
+                return np.nan
+            msb, msw = ss_between / dfb, ss_within / dfw
+            F = np.inf if msw == 0 else msb / msw
+            if not np.isfinite(F):
+                return np.nan
+            return float(1.0 - f_dist.cdf(F, dfb, dfw))
 
-            # Between-group SS
-            ss_between = sum(n * (v.mean() - grand_mean) ** 2 for v, n in zip(vals, ns))
-            # Within-group SS
-            ss_within = sum(((v - v.mean()) ** 2).sum() for v in vals)
+        # --------- Formatting ----------
+        mean_fmt = "{:." + str(mean_digits) + "f}"
+        std_fmt  = "{:."  + str(std_digits)  + "f}"
+        vol_fmt  = "{:."  + str(std_digits)  + "f}"
+        p_fmt    = "{:."  + str(p_digits)    + "f}"
 
-            df_between = k - 1
-            df_within = n_total - k
-            if df_within <= 0:
-                return np.nan, np.nan, df_between, df_within, k, n_total
+        table_rows: Dict[str, Dict[str, str]] = {}
+        all_regimes = set()
+        pvals: Dict[str, str] = {}
 
-            ms_between = ss_between / df_between
-            ms_within = ss_within / df_within
-            if ms_within == 0:
-                F = np.inf
+        # For nearest matching, convert regime index to month-end timestamps
+        reg_ts = regime_m.copy()
+        reg_ts.index = regime_m.index.to_timestamp("M")
+
+        # --------- Iterate assets ----------
+        for asset, mr in monthly_returns.items():
+            r = _ensure_series(mr).dropna().copy()
+            if not isinstance(r.index, (pd.DatetimeIndex, pd.PeriodIndex)):
+                raise TypeError(f"monthly_returns for '{asset}' must have a DatetimeIndex or PeriodIndex.")
+
+            # Force monthly PeriodIndex for the returns series
+            r = _to_month_period_index(r).rename("ret")
+
+            if match_nearest:
+                # Convert to month-end timestamps for nearest-match with tolerance
+                r_ts = r.copy()
+                r_ts.index = r.index.to_timestamp("M")
+                reg_matched = reg_ts.reindex(r_ts.index, method="nearest", tolerance=pd.Timedelta(match_tolerance))
+                aligned = pd.concat([r_ts, reg_matched.rename("regime")], axis=1).dropna(subset=["regime"])
             else:
-                F = ms_between / ms_within
+                # Exact monthly join via PeriodIndex
+                aligned = pd.concat([r, regime_m], axis=1, join="inner").dropna(subset=["regime"])
 
-            if SCIPY_OK and np.isfinite(F):
-                p = 1.0 - f_dist.cdf(F, df_between, df_within)
+            if aligned.empty:
+                raise ValueError(f"No overlapping months between '{asset}' returns and model regime (after matching).")
+
+            # Integer regime labels
+            aligned["regime"] = aligned["regime"].astype(int)
+
+            # Per-regime statistics over monthly returns
+            grp = aligned.groupby("regime")["ret"]
+            mu = grp.mean()
+            sd = grp.std(ddof=1)  # monthly std within regime
+
+            # Compute volatility to display (monthly or annualized)
+            if vol_annualize:
+                vol = sd * sqrt(12.0)
+                vol_unit = vol_label if vol_label else "ann vol"
             else:
-                p = np.nan
-            return float(F), float(p), int(df_between), int(df_within), int(k), int(n_total)
+                vol = sd.copy()
+                vol_unit = vol_label if vol_label else "monthly vol"
 
-        def _kruskal(groups_dict: Dict[int, np.ndarray]):
-            """Return H, pvalue, k (groups)."""
-            vals = [g[~np.isnan(g)] for g in groups_dict.values() if g is not None and g.size > 0]
-            k = len(vals)
-            if k < 2:
-                return np.nan, np.nan, k
-            if SCIPY_OK:
-                H, p = kruskal_test(*vals)
-                return float(H), float(p), int(k)
-            else:
-                # No scipy: cannot compute exact p; return NaN
-                return np.nan, np.nan, k
+            # Fill the summary cell: "mean ± std (ann vol X.XXX)"
+            for reg in mu.index:
+                all_regimes.add(reg)
+                key = str(reg)
+                table_rows.setdefault(key, {})
+                std_val = sd.loc[reg] if reg in sd.index else np.nan
+                vol_val = vol.loc[reg] if reg in vol.index else np.nan
+                cell = f"{mean_fmt.format(mu.loc[reg])} ± {std_fmt.format(std_val)} ({vol_unit} {vol_fmt.format(vol_val)})"
+                table_rows[key][asset] = cell
 
-        def _holm_bonferroni(pvals: np.ndarray) -> np.ndarray:
-            """Holm step-down adjustment (returns adjusted p-values)."""
-            m = len(pvals)
-            order = np.argsort(pvals)
-            adj = np.empty(m, dtype=float)
-            prev = 0.0
-            for i, idx in enumerate(order):
-                rank = i + 1
-                adj_p = (m - i) * pvals[idx]
-                adj[idx] = max(adj_p, prev)  # ensure monotonicity
-                prev = adj[idx]
-            return np.minimum(adj, 1.0)
+            # ANOVA p-value comparing regime means for this asset
+            groups = {int(reg): g.to_numpy(copy=True) for reg, g in grp}
+            p = _anova_numpy(groups)
+            pvals[asset] = ("" if (p is None or np.isnan(p)) else p_fmt.format(p))
 
-        pairwise_rows = []
+        if not all_regimes:
+            raise ValueError("No regimes found after alignment.")
 
-        # Run tests per asset
-        anova_rows = []
-        kruskal_rows = []
+        # Assemble rows in ascending order of regime label
+        row_labels = [str(r) for r in sorted(all_regimes)]
+        out = pd.DataFrame(
+            [
+                {**{a: "" for a in monthly_returns.keys()}, **table_rows.get(rl, {})}
+                for rl in row_labels
+            ],
+            index=row_labels,
+        )
+        out.index.name = "Regime"
 
-        for asset, groups in per_asset_groups.items():
-            if do_anova:
-                F, p, dfb, dfw, k_groups, n_tot = _anova_numpy(groups)
-                anova_rows.append({
-                    "asset": asset,
-                    "F": F,
-                    "pvalue": p,
-                    "df_between": dfb,
-                    "df_within": dfw,
-                    "n_groups": k_groups,
-                    "n_total": n_tot,
-                })
+        # Append p-value row
+        final = pd.concat([out, pd.DataFrame([pvals], index=["ANOVA p-value"])], axis=0)
+        return final
 
-            if do_kruskal:
-                H, p, k_groups = _kruskal(groups)
-                kruskal_rows.append({
-                    "asset": asset,
-                    "H": H,
-                    "pvalue": p,
-                    "k": k_groups,
-                })
+    def predict(self, oos_data: pd.DataFrame):
+        """
+        Assign regimes to out-of-sample (OOS) data using calibrated parameters, considering the jump penalty (lmbd),
+        and update object parameters.
 
-            if do_pairwise and SCIPY_OK:
-                # all pair (i<j) Welch t-tests with Holm correction
-                regs = sorted(groups.keys())
-                samples = {r: groups[r][~np.isnan(groups[r])] for r in regs}
-                pairs = [(i, j) for idx, i in enumerate(regs) for j in regs[idx+1:]]
-                t_list, p_list = [], []
-                keep_pairs = []
+        Parameters
+        ----------
+        oos_data : pd.DataFrame
+            Out-of-sample data with the same features as the in-sample data.
+        """
+        if self.mu is None or self.lmbd is None:
+            raise RuntimeError("Model must be calibrated on IS data before predicting OOS data.")
+        if not isinstance(oos_data, pd.DataFrame):
+            raise TypeError("OOS data must be a pandas DataFrame.")
+        if not all(col in oos_data.columns for col in self.feature_names):
+            raise ValueError("OOS data must contain the same features as the IS data.")
 
-                for i, j in pairs:
-                    xi = samples[i]
-                    xj = samples[j]
-                    if len(xi) >= 2 and len(xj) >= 2:
-                        t_stat, p_val = ttest_ind(xi, xj, equal_var=False, nan_policy="omit")
-                        t_list.append(float(t_stat))
-                        p_list.append(float(p_val))
-                        keep_pairs.append((i, j))
+        # Normalize OOS data using the same normalization method as IS data
+        oos_data = oos_data[self.feature_names].copy()  # Ensure column order matches
+        self.data = normalized(oos_data)  # Update the object's data attribute
 
-                if p_list:
-                    p_adj = _holm_bonferroni(np.array(p_list))
-                    for (i, j), t_stat, p_raw, p_corr in zip(keep_pairs, t_list, p_list, p_adj):
-                        pairwise_rows.append({
-                            "asset": asset,
-                            "reg_i": i,
-                            "reg_j": j,
-                            "t_stat": t_stat,
-                            "pvalue_raw": p_raw,
-                            "pvalue_holm": float(p_corr),
-                            "method": "Welch t-test (Holm adjusted)"
-                        })
+        # Assign regimes based on the closest cluster center, considering jump penalty
+        Y = self.data.to_numpy()
+        mu = self.mu.to_numpy()
+        T, K = Y.shape[0], mu.shape[0]
 
-        if do_anova:
-            tests["anova"] = pd.DataFrame(anova_rows).set_index("asset") if anova_rows else pd.DataFrame()
-        if do_kruskal:
-            tests["kruskal"] = pd.DataFrame(kruskal_rows).set_index("asset") if kruskal_rows else pd.DataFrame()
-        if do_pairwise and pairwise_rows:
-            tests["pairwise"] = (
-                pd.DataFrame(pairwise_rows)
-                  .set_index(["asset", "reg_i", "reg_j"])
-                  .sort_index()
-            )
+        # Dynamic programming to minimize cost with jump penalty
+        cost = np.full((T, K), np.inf)  # Cost matrix
+        backtrack = np.zeros((T, K), dtype=int)  # Backtrack matrix
 
-        return summary_all, summary_all_pct, tests
+        # Initialize the first time step
+        for k in range(K):
+            cost[0, k] = np.sum((Y[0] - mu[k]) ** 2)
 
-def backtest_centers_over_time(
+        # Fill the cost matrix
+        for t in range(1, T):
+            for k in range(K):
+                for j in range(K):
+                    jump_cost = self.lmbd if j != k else 0
+                    total_cost = cost[t - 1, j] + np.sum((Y[t] - mu[k]) ** 2) + jump_cost
+                    if total_cost < cost[t, k]:
+                        cost[t, k] = total_cost
+                        backtrack[t, k] = j
+
+        # Backtrack to find the optimal state sequence
+        self.s = np.zeros(T, dtype=int)
+        self.s[-1] = np.argmin(cost[-1]) + 1  # Regimes are 1-indexed
+        for t in range(T - 2, -1, -1):
+            self.s[t] = backtrack[t + 1, self.s[t + 1] - 1] + 1
+
+        # Update regime series
+        self.regime_series = pd.Series(self.s, index=self.data.index, name="regime")
+
+def backtest_centers_drift(
     data: pd.DataFrame,
     k: int,
     first_cutoff: str | pd.Timestamp,
@@ -1319,3 +1228,4 @@ def plot_frobenius_drift(
     ax.legend()
     fig.tight_layout()
     return fig, ax
+
