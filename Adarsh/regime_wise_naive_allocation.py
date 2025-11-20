@@ -8,18 +8,19 @@ import matplotlib.pyplot as plt
 from scipy.optimize import minimize
 from matplotlib.patches import Rectangle
 import os
+import warnings
+warnings.filterwarnings("ignore")
+
 
 def load_regime_data(regimename):
     if regimename=="kmeans":
-        Regime_clusters=pd.read_csv("data/TSKMeans_regime_k5.csv")
+        Regime_clusters=pd.read_csv("data/kmeans_regimes_k5.csv")
     elif regimename=="gmm":
         Regime_clusters_test=pd.read_csv("data/BGMM_Regime_Test.csv")
         Regime_clusters_train=pd.read_csv("data/BGMM_Regime_Train.csv")
         Regime_clusters = pd.concat([Regime_clusters_test, Regime_clusters_train])
-    elif regimename=="hmm":
-        Regime_clusters=pd.read_csv("data/regime_path_full_K5_FSW.csv")
     else:
-        raise ValueError(f"Invalid regime name: {regimename}")
+        Regime_clusters=pd.read_csv("data/1_HMM_regime.csv")
 
     Regime_clusters.columns=["Date", "Regime"]
     Regime_clusters["Date"]=pd.to_datetime(Regime_clusters["Date"]).dt.to_period("M")
@@ -28,7 +29,6 @@ def load_regime_data(regimename):
     monthly_ret["val-grwth"]=monthly_ret["Russell 1000 Value"]-monthly_ret["Russell 1000 Growth"]
     monthly_ret["creditprem"]=monthly_ret["US HY Corporate Bond"]-monthly_ret["US IG Corporate Bond"]
     monthly_ret["termprem"]=monthly_ret["US Long-term Treasury"]-monthly_ret["US Short-term Treasury"]
-    monthly_ret["EMprem"]=monthly_ret["MSCI EM Index (EM Equities)"]-monthly_ret["MSCI World ex USA Index (DM ex-US Equities)"]
     monthly_ret["Sizeprem"]=monthly_ret["Russell 2000"]-monthly_ret["Russell 1000"]
 
     df = monthly_ret.merge(Regime_clusters, on="Date", how="left")
@@ -140,7 +140,7 @@ def get_signal_based_target_v2(base, signals, total_tilt_budget=0.20,
 
 def optimize_weights_v2(target, base, current_weights=None, 
                         min_equity=0.50, max_equity=0.70, 
-                        max_asset_deviation=0.15, 
+                        max_asset_deviation=0.10, 
                         turnover_penalty=0.001):
     """
     Optimized weight allocation with better-structured objective.
@@ -310,6 +310,47 @@ def analyze_and_plot_performance(finaldf, regime_name, lookfwd, output_folder="A
 
     tactical_stats = perf_stats(finaldf["tactical_next"].dropna())
     static_stats = perf_stats(finaldf["static_next"].dropna())
+
+    # === Excess Return (Tactical − Static) ===
+    tac = finaldf["tactical_next"].dropna()
+    stat = finaldf["static_next"].dropna()
+
+    excess_ret = (tac.mean() - stat.mean()) * 12
+
+    # === Tracking Error ===
+    active_returns = tac - stat
+    tracking_error = active_returns.std() * np.sqrt(12)
+
+    # === Information Ratio ===
+    info_ratio = excess_ret / tracking_error if tracking_error != 0 else np.nan
+
+
+    # === Create summary table ===
+    excesssummary = pd.DataFrame({
+        "Metric": ["Excess Return", "Tracking Error", "Information Ratio"],
+        "Value": [
+            f"{(excess_ret * 100).round(2)}%",       # percent
+            f"{(tracking_error * 100).round(2)}%",   # percent
+            info_ratio.round(2)                      # ratio
+        ]
+    })
+
+    # === Save table as image ===
+    fig, ax = plt.subplots(figsize=(6, 2))
+    ax.axis('off')
+    table = ax.table(
+        cellText=excesssummary.values,
+        colLabels=excesssummary.columns,
+        cellLoc='center',
+        loc='center'
+    )
+
+    table.scale(1, 2)
+    plt.tight_layout()
+    plot_path = os.path.join(output_folder, f"{file_prefix}_excessperf.png")
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    print(f"Plot saved: {plot_path}")
+    plt.close()
 
     # Create figure with two subplots
     fig = plt.figure(figsize=(16, 7))
@@ -539,17 +580,95 @@ def analyze_and_plot_performance(finaldf, regime_name, lookfwd, output_folder="A
         'lookfwd': lookfwd
     }
 
+def plot_weights_over_time(finaldf, regime_name, lookfwd, output_folder="Adarsh/output"):
+    """
+    Plot portfolio weights over time as a stacked area chart.
+    
+    Parameters:
+    - finaldf: DataFrame with Date, Regime, and Weight columns
+    - regime_name: Name of the regime model (e.g., 'kmeans', 'gmm', 'hmm')
+    - lookfwd: lookfwd period in months
+    - output_folder: Folder to save outputs (default: 'Adarsh/output')
+    """
+    
+    # Create output folder if it doesn't exist
+    os.makedirs(output_folder, exist_ok=True)
+    
+    # Create file prefix
+    file_prefix = f"{regime_name}_lb{lookfwd}"
+    
+    # Convert period to datetime if needed
+    finaldf = finaldf.copy()
+    if not pd.api.types.is_datetime64_any_dtype(finaldf["Date"]):
+        finaldf["Date"] = pd.to_datetime(finaldf["Date"].astype(str))
+    
+    # Define weight columns
+    w_cols = [
+        "Weight: Russell 1000 Value",
+        "Weight: Russell 1000 Growth",
+        "Weight: Russell 2000",
+        "Weight: US Short-term Treasury",
+        "Weight: US Long-term Treasury",
+        "Weight: US IG Corporate Bond",
+        "Weight: US HY Corporate Bond"
+    ]
+    
+    # Extract weight data
+    weights_df = finaldf[["Date"] + w_cols].copy()
+    weights_df = weights_df.sort_values("Date")
+    
+    # Create the plot
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    # Define colors for each asset
+    colors = {
+        "Weight: Russell 1000 Value": '#5B9BD5',      # Blue
+        "Weight: Russell 1000 Growth": '#F4B183',     # Orange
+        "Weight: Russell 2000": '#C55A5A',            # Red
+        "Weight: US Short-term Treasury": '#A5A5A5',  # Gray
+        "Weight: US Long-term Treasury": '#C27BA0',   # Pink/Purple
+        "Weight: US IG Corporate Bond": '#70AD47',    # Green
+        "Weight: US HY Corporate Bond": '#4BACC6'     # Cyan
+    }
+    
+    # Create stacked area chart
+    ax.stackplot(
+        weights_df["Date"],
+        *[weights_df[col] for col in w_cols],
+        labels=[col.replace("Weight: ", "") for col in w_cols],
+        colors=[colors[col] for col in w_cols],
+        alpha=0.85
+    )
+    
+    # Styling
+    ax.set_ylim(0, 1)
+    ax.set_xlabel("Date", fontsize=12)
+    ax.set_ylabel("Weight", fontsize=12)
+    ax.set_title(f"Portfolio Weight Changes Over Time (Monthly Rebalancing)\n{regime_name.upper()}, {lookfwd}M lookfwd", 
+                 fontsize=14, fontweight='bold')
+    ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), fontsize=10)
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    plt.tight_layout()
+    
+    # Save figure
+    plot_path = os.path.join(output_folder, f"{file_prefix}_weights_over_time.png")
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    print(f"Weights plot saved: {plot_path}")
+    plt.close()
+
+
 ## Input data
 if __name__=="__main__":
-    russell2000=pd.read_csv("data/Russel2000data.csv")
+    russell2000=pd.read_csv("Russel2000data.csv")
     russell2000['Russell 2000'] = (russell2000['RTY Index'] - russell2000['RTY Index'].shift(-1)) / russell2000['RTY Index'].shift(-1)
     russell2000["Date"]=pd.to_datetime(russell2000["Date"]).dt.to_period("M")
-    monthly_ret= pd.read_csv("data/df_1M_ret.csv")
+    monthly_ret= pd.read_csv("df_1M_ret.csv")
     monthly_ret["Date"]=pd.to_datetime(monthly_ret["Date"]).dt.to_period("M")
     monthly_ret= monthly_ret.merge(russell2000, on="Date", how="left")
 
     regimeslist=["kmeans", "gmm", "hmm"]
-    lookfwds=[3,6,9,12]
+    lookfwds=[6,12]
 
     # BASE (strategic neutral) weights
     base = pd.Series({
@@ -664,6 +783,13 @@ if __name__=="__main__":
                 
                 # Analyze and plot performance
                 stats = analyze_and_plot_performance(
+                    finaldf=finaldf.dropna(subset=["tactical_next"]), 
+                    regime_name=regime,
+                    lookfwd=lookfwd
+                )
+
+                # After the analyze_and_plot_performance call, add:
+                plot_weights_over_time(
                     finaldf=finaldf.dropna(subset=["tactical_next"]), 
                     regime_name=regime,
                     lookfwd=lookfwd
